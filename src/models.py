@@ -6,14 +6,15 @@ class MLP(nn.Module):
     def __init__(self, input_dim, hidden=256, num_classes=10):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden),
-            nn.ReLU(),
+            nn.Linear(input_dim, hidden), #Encoder (same depth)
             nn.BatchNorm1d(hidden),
-            nn.Dropout(0.2),
+            nn.ReLU(),
             nn.Linear(hidden, hidden),
-            nn.ReLU(),
             nn.BatchNorm1d(hidden),
-            nn.Dropout(0.2),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden), #Classifier
+            nn.BatchNorm1d(hidden),
+            nn.ReLU(),
             nn.Linear(hidden, num_classes)
         )
 
@@ -47,7 +48,7 @@ class Encoder(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.BatchNorm1d(hidden_dim),
+            #nn.BatchNorm1d(hidden_dim),
             nn.Linear(hidden_dim, latent_dim),
             nn.ReLU(),
         )
@@ -62,7 +63,7 @@ class LabelClassifier(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.ReLU(),
-            nn.BatchNorm1d(latent_dim),
+            #nn.BatchNorm1d(latent_dim),
             nn.Linear(latent_dim, num_classes)
         )
 
@@ -76,7 +77,7 @@ class DomainClassifier(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
-            nn.BatchNorm1d(hidden_dim),
+            #nn.BatchNorm1d(hidden_dim),
             nn.Linear(hidden_dim, 1)
         )
 

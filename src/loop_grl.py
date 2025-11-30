@@ -6,36 +6,38 @@ import numpy as np
 from models import *
 from torch.autograd import Function
 
+# ================================
+# Contrastive loss
+# ================================
 def contrastive_loss(z, y, temperature=0.1):
     z = F.normalize(z, dim=1)
     N = z.size(0)
     sim = torch.matmul(z, z.T) / temperature
     mask = torch.eye(N, dtype=torch.bool, device=z.device)
     sim = sim.masked_fill(mask, -9e15)
-    y = y.contiguous().view(-1, 1)
+    y = y.view(-1, 1)
     pos_mask = (y == y.T).float()
     exp_sim = torch.exp(sim)
     denom = exp_sim.sum(dim=1, keepdim=True)
     numerator = exp_sim * pos_mask
-    loss = -torch.log((numerator.sum(dim=1) + 1e-9) / (denom.squeeze() + 1e-9))
+    loss = -torch.log((numerator.sum(dim=1)+1e-9) / (denom.squeeze()+1e-9))
     return loss.mean()
 
-#data = np.load("../data/frog_zeb_pca100.npz", allow_pickle=True)
+# ================================
+# Load data
+# ================================
 data = np.load("../data/frog_zeb_processed.npz", allow_pickle=True)
 X_s = data["X_s"]
 y_s = data["y_s"]
 X_t = data["X_t"]
 y_t = data["y_t"]
 
-print("X_s:", X_s.shape, "y_s:", y_s.shape)
-print("X_t:", X_t.shape, "y_t:", y_t.shape)
-
 d_s = np.ones_like(y_s, dtype=np.int64)
 d_t = np.zeros_like(y_t, dtype=np.int64)
 
 X_all = np.concatenate([X_s, X_t], axis=0)
 d_all = np.concatenate([d_s, d_t], axis=0)
-y_t_dummy = -np.ones_like(y_t, dtype=np.int64) #all set to -1, prevent data leakage
+y_t_dummy = -np.ones_like(y_t)
 y_all = np.concatenate([y_s, y_t_dummy], axis=0)
 
 X_all_tensor = torch.tensor(X_all, dtype=torch.float32)
@@ -54,11 +56,15 @@ train_loader = DataLoader(
     shuffle=True
 )
 
+# ================================
+# GRL
+# ================================
 class GradReverse(Function):
     @staticmethod
     def forward(ctx, x, lambd):
         ctx.lambd = lambd
         return x.view_as(x)
+
     @staticmethod
     def backward(ctx, grad_output):
         return grad_output.neg() * ctx.lambd, None
@@ -66,19 +72,22 @@ class GradReverse(Function):
 def grad_reverse(x, lambd=1.0):
     return GradReverse.apply(x, lambd)
 
-if __name__ == "__main__":
+# ================================
+# Single run function
+# return: (src_acc_final, tgt_acc_final)
+# ================================
+def run_single_training(use_contrastive):
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     input_dim = X_s.shape[1]
     num_classes = len(np.unique(y_s))
-    latent_dim = 64 
-    hidden_dim = 128 
-    lambda_d = 0.1 
-    lambda_contrastive = 0.25 
-    use_contrastive = True # Ablation study: set to False to disable contrastive loss
-    num_epochs = 20
-    lr = 5e-5
-
+    latent_dim = 64
+    hidden_dim = 128
+    lambda_d = 0.1
+    lambda_contrastive = 0.25
+    num_epochs = 15
+    lr = 0.00005
 
     encoder = Encoder(input_dim, hidden_dim=hidden_dim, latent_dim=latent_dim).to(device)
     label_clf = LabelClassifier(latent_dim, num_classes).to(device)
@@ -94,106 +103,87 @@ if __name__ == "__main__":
     criterion_y = nn.CrossEntropyLoss()
     criterion_d = nn.BCEWithLogitsLoss()
 
+    # ===================== Train =====================
     for epoch in range(num_epochs):
         encoder.train()
         label_clf.train()
         domain_clf.train()
 
-        total_loss = 0.0
-        total_y_loss = 0.0
-        total_d_loss = 0.0
-        total_con_loss = 0.0
-
         for xb, yb, db in train_loader:
             xb, yb, db = xb.to(device), yb.to(device), db.to(device)
 
-            # 1) Encoder
             z = encoder(xb)
-
-            # 2) classification loss (source only)
             logits_y = label_clf(z)
             src_mask = (yb != -1)
+
+            # y loss
             if src_mask.any():
                 y_loss = criterion_y(logits_y[src_mask], yb[src_mask])
             else:
                 y_loss = torch.tensor(0.0, device=device)
 
-            # 3) domain loss (GRL)
+            # domain loss
             z_rev = grad_reverse(z, lambd=1.0)
-            # z_rev = z #observe the loss curve without GRL
-            logits_d = domain_clf(z_rev).squeeze(1)
-            d_loss = criterion_d(logits_d, db)
+            d_loss = criterion_d(domain_clf(z_rev).squeeze(1), db)
 
-            # 4) supervised contrastive loss (source only)
+            # contrastive loss
             if use_contrastive and src_mask.sum() > 1:
-                z_src = z[src_mask]
-                y_src = yb[src_mask]
-                con_loss = contrastive_loss(z_src, y_src)
+                con_loss = contrastive_loss(z[src_mask], yb[src_mask])
             else:
                 con_loss = torch.tensor(0.0, device=device)
 
-            # 5) total loss
             loss = y_loss + lambda_d * d_loss + lambda_contrastive * con_loss
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
-            total_y_loss += y_loss.item()
-            total_d_loss += d_loss.item()
-            total_con_loss += con_loss.item()
-
-        avg_loss = total_loss / len(train_loader)
-
-        # ========= EPOCH ACCURACY (new) =========
-        encoder.eval()
-        label_clf.eval()
-        with torch.no_grad():
-            # source acc
-            z_s = encoder(X_s_tensor.to(device))
-            logits_s = label_clf(z_s)
-            y_pred_s = logits_s.argmax(1).cpu()
-            src_acc = (y_pred_s == y_s_tensor).float().mean().item()
-
-            # target acc
-            z_t = encoder(X_t_tensor.to(device))
-            logits_t = label_clf(z_t)
-            y_pred_t = logits_t.argmax(1).cpu()
-            tgt_acc = (y_pred_t == y_t_tensor).float().mean().item()
-
-        print(
-            f"Epoch {epoch+1}/{num_epochs} | "
-            f"Loss={avg_loss:.4f} | y={total_y_loss/len(train_loader):.4f} | "
-            f"d={total_d_loss/len(train_loader):.4f} | con={total_con_loss/len(train_loader):.4f} | "
-            f"SrcAcc={src_acc:.4f} | TgtAcc={tgt_acc:.4f}"
-        )
-
-
-    # ================= Final evaluation and saving =================
+    # ===================== Evaluation =====================
     encoder.eval()
     label_clf.eval()
     with torch.no_grad():
-        X_all_tensor = torch.tensor(X_all, dtype=torch.float32).to(device)
-        z_all = encoder(X_all_tensor).cpu().numpy()
-        logits_all = label_clf(encoder(X_all_tensor))
-        y_pred_all = logits_all.argmax(1).cpu().numpy()
-
-        # save
-        np.save("../results/z_grl.npy", z_all)
-        np.save("../results/y_pred_grl.npy", y_pred_all)
-
-        # final source accuracy
+        # source
         z_s = encoder(X_s_tensor.to(device))
         logits_s = label_clf(z_s)
         src_acc_final = (logits_s.argmax(1).cpu() == y_s_tensor).float().mean().item()
 
-        # final target accuracy
+        # target
         z_t = encoder(X_t_tensor.to(device))
         logits_t = label_clf(z_t)
         tgt_acc_final = (logits_t.argmax(1).cpu() == y_t_tensor).float().mean().item()
 
-    print("\n===== FINAL ACCURACY =====")
-    print(f"Final Source Acc = {src_acc_final:.4f}")
-    print(f"Final Target Acc = {tgt_acc_final:.4f}")
+    return src_acc_final, tgt_acc_final
 
+
+# ================================
+# Run N × with contrastive
+# ================================
+N1 = 20
+src_con, tgt_con = [], []
+
+for i in range(N1):
+    s, t = run_single_training(use_contrastive=True)
+    src_con.append(s)
+    tgt_con.append(t)
+    print(f"[Contrastive] Run {i+1}/{N1}: Src={s:.4f}  Tgt={t:.4f}")
+
+print("\n======= WITH CONTRASTIVE =======")
+print(f"Source Mean = {np.mean(src_con):.4f}, Std = {np.std(src_con):.4f}")
+print(f"Target Mean = {np.mean(tgt_con):.4f}, Std = {np.std(tgt_con):.4f}")
+
+
+# ================================
+# Run N × without contrastive
+# ================================
+N2 = 20
+src_no, tgt_no = [], []
+
+for i in range(N2):
+    s, t = run_single_training(use_contrastive=False)
+    src_no.append(s)
+    tgt_no.append(t)
+    print(f"[NO Contrastive] Run {i+1}/{N2}: Src={s:.4f}  Tgt={t:.4f}")
+
+print("\n======= WITHOUT CONTRASTIVE =======")
+print(f"Source Mean = {np.mean(src_no):.4f}, Std = {np.std(src_no):.4f}")
+print(f"Target Mean = {np.mean(tgt_no):.4f}, Std = {np.std(tgt_no):.4f}")

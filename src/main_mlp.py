@@ -5,7 +5,7 @@ from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
 from models import MLP
 
-data = np.load("data/frog_zeb_data_processed.npz", allow_pickle=True)
+data = np.load("../data/frog_zeb_processed.npz", allow_pickle=True)
 X_s = data["X_s"]
 y_s = data["y_s"]
 X_t = data["X_t"]
@@ -28,7 +28,7 @@ input_dim = X_s.shape[1]
 num_classes = len(np.unique(y_s))
 num_epochs = 20
 h = 256
-lr = 1e-3
+lr = 0.0005
 
 model = MLP(input_dim, hidden=h, num_classes=num_classes)
 optimizer = torch.optim.Adam(model.parameters(), lr=lr)

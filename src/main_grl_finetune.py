@@ -35,7 +35,7 @@ d_t = np.zeros_like(y_t, dtype=np.int64)
 
 X_all = np.concatenate([X_s, X_t], axis=0)
 d_all = np.concatenate([d_s, d_t], axis=0)
-y_t_dummy = -np.ones_like(y_t, dtype=np.int64) #all set to -1, prevent data leakage
+y_t_dummy = -np.ones_like(y_t, dtype=np.int64)
 y_all = np.concatenate([y_s, y_t_dummy], axis=0)
 
 X_all_tensor = torch.tensor(X_all, dtype=torch.float32)
@@ -71,14 +71,18 @@ if __name__ == "__main__":
 
     input_dim = X_s.shape[1]
     num_classes = len(np.unique(y_s))
-    latent_dim = 64 
-    hidden_dim = 128 
-    lambda_d = 0.1 
-    lambda_contrastive = 0.25 
-    use_contrastive = True # Ablation study: set to False to disable contrastive loss
-    num_epochs = 20
-    lr = 5e-5
+    latent_dim = 256#64
+    hidden_dim = 512#64
+    lambda_d = 0.05#0.1
+    lambda_contrastive = 0.1#0.2
+    use_contrastive = True
+    num_epochs = 10 #20
+    lr = 5e-5#1e-4
 
+    ablation_mode = False
+    if ablation_mode:
+        lambda_d = 0.0
+        use_contrastive = False
 
     encoder = Encoder(input_dim, hidden_dim=hidden_dim, latent_dim=latent_dim).to(device)
     label_clf = LabelClassifier(latent_dim, num_classes).to(device)
@@ -94,6 +98,9 @@ if __name__ == "__main__":
     criterion_y = nn.CrossEntropyLoss()
     criterion_d = nn.BCEWithLogitsLoss()
 
+    # ===========================
+    # Stage 1: Standard GRL training
+    # ===========================
     for epoch in range(num_epochs):
         encoder.train()
         label_clf.train()
@@ -107,10 +114,8 @@ if __name__ == "__main__":
         for xb, yb, db in train_loader:
             xb, yb, db = xb.to(device), yb.to(device), db.to(device)
 
-            # 1) Encoder
             z = encoder(xb)
 
-            # 2) classification loss (source only)
             logits_y = label_clf(z)
             src_mask = (yb != -1)
             if src_mask.any():
@@ -118,13 +123,10 @@ if __name__ == "__main__":
             else:
                 y_loss = torch.tensor(0.0, device=device)
 
-            # 3) domain loss (GRL)
             z_rev = grad_reverse(z, lambd=1.0)
-            # z_rev = z #observe the loss curve without GRL
             logits_d = domain_clf(z_rev).squeeze(1)
             d_loss = criterion_d(logits_d, db)
 
-            # 4) supervised contrastive loss (source only)
             if use_contrastive and src_mask.sum() > 1:
                 z_src = z[src_mask]
                 y_src = yb[src_mask]
@@ -132,7 +134,6 @@ if __name__ == "__main__":
             else:
                 con_loss = torch.tensor(0.0, device=device)
 
-            # 5) total loss
             loss = y_loss + lambda_d * d_loss + lambda_contrastive * con_loss
 
             optimizer.zero_grad()
@@ -146,21 +147,16 @@ if __name__ == "__main__":
 
         avg_loss = total_loss / len(train_loader)
 
-        # ========= EPOCH ACCURACY (new) =========
         encoder.eval()
         label_clf.eval()
         with torch.no_grad():
-            # source acc
             z_s = encoder(X_s_tensor.to(device))
             logits_s = label_clf(z_s)
-            y_pred_s = logits_s.argmax(1).cpu()
-            src_acc = (y_pred_s == y_s_tensor).float().mean().item()
+            src_acc = (logits_s.argmax(1).cpu() == y_s_tensor).float().mean().item()
 
-            # target acc
             z_t = encoder(X_t_tensor.to(device))
             logits_t = label_clf(z_t)
-            y_pred_t = logits_t.argmax(1).cpu()
-            tgt_acc = (y_pred_t == y_t_tensor).float().mean().item()
+            tgt_acc = (logits_t.argmax(1).cpu() == y_t_tensor).float().mean().item()
 
         print(
             f"Epoch {epoch+1}/{num_epochs} | "
@@ -169,31 +165,100 @@ if __name__ == "__main__":
             f"SrcAcc={src_acc:.4f} | TgtAcc={tgt_acc:.4f}"
         )
 
+    # ===========================
+    # Stage 1 Final Acc
+    # ===========================
+    encoder.eval(); label_clf.eval()
+    with torch.no_grad():
+        pred_s = label_clf(encoder(X_s_tensor.to(device))).argmax(1).cpu()
+        pred_t = label_clf(encoder(X_t_tensor.to(device))).argmax(1).cpu()
+        src_acc_before = (pred_s == y_s_tensor).float().mean().item()
+        tgt_acc_before = (pred_t == y_t_tensor).float().mean().item()
 
-    # ================= Final evaluation and saving =================
+    print("\n===== BEFORE Fine-Tuning =====")
+    print(f"Source Acc = {src_acc_before:.4f}")
+    print(f"Target Acc = {tgt_acc_before:.4f}")
+
+    # ===========================
+    # Stage 2: Freeze encoder, compute weights from domain discriminator
+    # ===========================
+    encoder.eval()
+    for p in encoder.parameters():
+        p.requires_grad_(False)
+
+    domain_clf.eval()
+    with torch.no_grad():
+        z_s = encoder(X_s_tensor.to(device))
+        p_source = torch.sigmoid(domain_clf(z_s)).cpu().numpy().flatten()
+
+    eps = 1e-4
+    w = 1.0 / (p_source + eps)
+    w = w / w.mean()
+
+    w_tensor = torch.tensor(w, dtype=torch.float32)
+
+    ft_loader = DataLoader(
+        TensorDataset(X_s_tensor, y_s_tensor, w_tensor),
+        batch_size=128, shuffle=True
+    )
+
+    # ===========================
+    # Stage 2: Fine-tune classifier only
+    # ===========================
+    for p in label_clf.parameters():
+        p.requires_grad_(True)
+
+    optimizer_ft = torch.optim.Adam(label_clf.parameters(), lr=1e-4)
+
+    ft_epochs = 30
+    print("\n===== Fine-Tuning Classifier (Weighted CE) =====")
+    for epoch in range(ft_epochs):
+        label_clf.train()
+        total = 0
+
+        for xb, yb, wb in ft_loader:
+            xb, yb, wb = xb.to(device), yb.to(device), wb.to(device)
+
+            with torch.no_grad():
+                z = encoder(xb)
+
+            logits = label_clf(z)
+            ce = F.cross_entropy(logits, yb, reduction="none")
+            loss = (ce * wb).mean()
+
+            optimizer_ft.zero_grad()
+            loss.backward()
+            optimizer_ft.step()
+
+        # ===== 每个 epoch 后打印 ACC（NEW） =====
+        label_clf.eval()
+        with torch.no_grad():
+            # source acc
+            pred_s_ft = label_clf(encoder(X_s_tensor.to(device))).argmax(1).cpu()
+            src_acc_ft = (pred_s_ft == y_s_tensor).float().mean().item()
+
+            # target acc
+            pred_t_ft = label_clf(encoder(X_t_tensor.to(device))).argmax(1).cpu()
+            tgt_acc_ft = (pred_t_ft == y_t_tensor).float().mean().item()
+
+        print(f"FT Epoch {epoch+1}/{ft_epochs} "
+            f"| Loss={loss.item():.4f} "
+            f"| SrcAcc={src_acc_ft:.4f} "
+            f"| TgtAcc={tgt_acc_ft:.4f}")
+
+
+    # ===========================
+    # Final evaluation
+    # ===========================
     encoder.eval()
     label_clf.eval()
     with torch.no_grad():
-        X_all_tensor = torch.tensor(X_all, dtype=torch.float32).to(device)
-        z_all = encoder(X_all_tensor).cpu().numpy()
-        logits_all = label_clf(encoder(X_all_tensor))
-        y_pred_all = logits_all.argmax(1).cpu().numpy()
+        pred_s_after = label_clf(encoder(X_s_tensor.to(device))).argmax(1).cpu()
+        pred_t_after = label_clf(encoder(X_t_tensor.to(device))).argmax(1).cpu()
 
-        # save
-        np.save("../results/z_grl.npy", z_all)
-        np.save("../results/y_pred_grl.npy", y_pred_all)
+        src_acc_after = (pred_s_after == y_s_tensor).float().mean().item()
+        tgt_acc_after = (pred_t_after == y_t_tensor).float().mean().item()
 
-        # final source accuracy
-        z_s = encoder(X_s_tensor.to(device))
-        logits_s = label_clf(z_s)
-        src_acc_final = (logits_s.argmax(1).cpu() == y_s_tensor).float().mean().item()
-
-        # final target accuracy
-        z_t = encoder(X_t_tensor.to(device))
-        logits_t = label_clf(z_t)
-        tgt_acc_final = (logits_t.argmax(1).cpu() == y_t_tensor).float().mean().item()
-
-    print("\n===== FINAL ACCURACY =====")
-    print(f"Final Source Acc = {src_acc_final:.4f}")
-    print(f"Final Target Acc = {tgt_acc_final:.4f}")
-
+    print("\n===== AFTER Fine-Tuning =====")
+    print(f"Source Acc = {src_acc_after:.4f}")
+    print(f"Target Acc = {tgt_acc_after:.4f}")
